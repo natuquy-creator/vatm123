@@ -1,0 +1,238 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK (manual, ổn định trên CI)
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="$HOME/android-sdk"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+
+          # Command-line tools (Google)
+          curl -fsSL -o /tmp/cmdtools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          # Zip chứa thư mục cmdline-tools → đổi thành latest/
+          if [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ]; then
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          fi
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          echo "sdk.dir=$ANDROID_HOME" > "$HOME/local.properties"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" --licenses >/tmp/licenses.txt || true
+
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
+          echo "SDK OK:"
+          ls -la "$ANDROID_HOME"
+          ls -la "$ANDROID_HOME/platforms" || true
+          ls -la "$ANDROID_HOME/build-tools" || true
+
+      - name: Prepare Capacitor project
+        run: |
+          set -euo pipefail
+          echo "== Repo root =="
+          ls -la
+
+          rm -rf /tmp/www
+          mkdir -p /tmp/www
+
+          if [ -f www/index.html ]; then
+            cp -a www/. /tmp/www/
+          elif [ -f public/index.html ]; then
+            cp -a public/. /tmp/www/
+          elif [ -f index.html ]; then
+            # Layout phẳng (index.html + icon ở gốc repo)
+            cp -a index.html /tmp/www/
+            # icons/ nếu có
+            [ -d icons ] && cp -a icons /tmp/www/icons || true
+            # Copy icon/static files ở gốc vào www (không copy workflow)
+            for f in icon-192.png icon-192.svg icon-512.png apple-touch-icon.png favicon.ico manifest.json sw.js; do
+              [ -f "$f" ] && cp -a "$f" /tmp/www/ || true
+            done
+            # Nếu icon nằm ở gốc mà không có thư mục icons → tạo icons/
+            mkdir -p /tmp/www/icons
+            for f in icon-192.png icon-192.svg icon-512.png apple-touch-icon.png; do
+              if [ -f "$f" ] && [ ! -f "/tmp/www/icons/$f" ]; then
+                cp -a "$f" "/tmp/www/icons/$f"
+              fi
+            done
+          else
+            echo "ERROR: khong tim thay index.html"
+            find . -maxdepth 3 -type f | head -80
+            exit 1
+          fi
+
+          test -f /tmp/www/index.html
+          echo "== www preview =="
+          find /tmp/www -type f | head -40
+
+          # Chuẩn bị android-res từ thư mục android-res HOẶC file ic_launcher* ở gốc
+          rm -rf /tmp/android-res
+          if [ -d android-res ] && [ -n "$(find android-res -type f 2>/dev/null | head -1)" ]; then
+            cp -a android-res /tmp/android-res
+            echo "Dung android-res/"
+          elif [ -f ic_launcher.png ] || [ -f ic_launcher_foreground.png ]; then
+            echo "Dung ic_launcher* o goc repo"
+            mkdir -p /tmp/android-res/mipmap-hdpi \
+                     /tmp/android-res/mipmap-mdpi \
+                     /tmp/android-res/mipmap-xhdpi \
+                     /tmp/android-res/mipmap-xxhdpi \
+                     /tmp/android-res/mipmap-xxxhdpi \
+                     /tmp/android-res/mipmap-anydpi-v26
+            # Copy cùng file vào các mật độ (đủ để build; có thể không tối ưu DPI)
+            for dens in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+              [ -f ic_launcher.png ] && cp -a ic_launcher.png "/tmp/android-res/mipmap-$dens/ic_launcher.png"
+              [ -f ic_launcher_round.png ] && cp -a ic_launcher_round.png "/tmp/android-res/mipmap-$dens/ic_launcher_round.png"
+              [ -f ic_launcher_foreground.png ] && cp -a ic_launcher_foreground.png "/tmp/android-res/mipmap-$dens/ic_launcher_foreground.png"
+              [ -f ic_launcher_background.png ] && cp -a ic_launcher_background.png "/tmp/android-res/mipmap-$dens/ic_launcher_background.png"
+            done
+            if [ -f ic_launcher.xml ]; then
+              cp -a ic_launcher.xml /tmp/android-res/mipmap-anydpi-v26/ic_launcher.xml
+            else
+              cat > /tmp/android-res/mipmap-anydpi-v26/ic_launcher.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@mipmap/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+            fi
+            if [ -f ic_launcher_round.xml ]; then
+              cp -a ic_launcher_round.xml /tmp/android-res/mipmap-anydpi-v26/ic_launcher_round.xml
+            else
+              cp -a /tmp/android-res/mipmap-anydpi-v26/ic_launcher.xml /tmp/android-res/mipmap-anydpi-v26/ic_launcher_round.xml
+            fi
+          fi
+
+          # Reset capacitor scaffold
+          rm -rf www android node_modules package.json package-lock.json capacitor.config.json capacitor.config.ts
+          mkdir -p www
+          cp -a /tmp/www/. www/
+
+          python3 - <<'PY'
+          import json, pathlib
+          cfg = {
+            "appId": "vn.vatm.hosoxuatcanh",
+            "appName": "VATM Ho so",
+            "webDir": "www",
+            "backgroundColor": "#ffffff",
+            "android": {"allowMixedContent": True},
+            "server": {"androidScheme": "https"}
+          }
+          pathlib.Path("capacitor.config.json").write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+          pathlib.Path("package.json").write_text(json.dumps({
+            "name": "vatm-hoso",
+            "version": "1.0.0",
+            "private": True
+          }, indent=2) + "\n", encoding="utf-8")
+          print("config written")
+          PY
+
+          npm install @capacitor/core@6.1.2 @capacitor/cli@6.1.2 @capacitor/android@6.1.2 --no-fund --no-audit
+          npx cap --version
+          ls -la www
+
+      - name: Add Android + sync icons
+        run: |
+          set -euo pipefail
+          npx cap add android
+          npx cap sync android
+
+          if [ -d /tmp/android-res ]; then
+            RES=android/app/src/main/res
+            echo "Apply custom icons -> $RES"
+            rm -rf "$RES"/mipmap-*
+            rm -f "$RES"/drawable*/ic_launcher_foreground.xml \
+                  "$RES"/drawable*/ic_launcher_background.xml \
+                  "$RES"/values/ic_launcher_background.xml 2>/dev/null || true
+            cp -a /tmp/android-res/. "$RES"/
+            # Fix possible leading spaces in adaptive XML
+            python3 - <<'PY'
+          from pathlib import Path
+          import re
+          res = Path("android/app/src/main/res")
+          for p in res.rglob("*.xml"):
+              t = p.read_text(encoding="utf-8", errors="ignore")
+              t2 = re.sub(r"(?m)^[ \t]+(?=<\?xml)", "", t)
+              if t2 != t:
+                  p.write_text(t2, encoding="utf-8")
+                  print("fixed", p)
+          PY
+            find "$RES" -name 'ic_launcher*' | head -50
+          fi
+
+          test -f android/gradlew
+          chmod +x android/gradlew
+
+          # local.properties trỏ SDK
+          echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          cat android/local.properties
+
+          # Gradle memory
+          {
+            echo ""
+            echo "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8"
+            echo "org.gradle.daemon=false"
+            echo "android.useAndroidX=true"
+          } >> android/gradle.properties
+
+      - name: Build debug APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          test -d "$ANDROID_HOME/platforms"
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/gradle-build.log
+          echo "==== APK ===="
+          find app/build/outputs -type f -name '*.apk'
+          test -f app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: VATM-hoso-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload log if failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: /tmp/gradle-build.log
+          if-no-files-found: ignore
