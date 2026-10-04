@@ -1,0 +1,210 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/tmp/sdk-licenses.txt || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls -la "$ANDROID_HOME" || true
+
+      - name: Prepare Capacitor web project
+        run: |
+          set -euo pipefail
+          echo "== Workspace =="
+          ls -la
+
+          # Collect web assets
+          rm -rf /tmp/www /tmp/android-res
+          mkdir -p /tmp/www
+
+          if [ -f www/index.html ]; then
+            cp -a www/. /tmp/www/
+          elif [ -f public/index.html ]; then
+            cp -a public/. /tmp/www/
+          elif [ -f index.html ]; then
+            # Root layout: index.html + icons + other static files
+            rsync -a \
+              --exclude='.git' \
+              --exclude='.github' \
+              --exclude='node_modules' \
+              --exclude='android' \
+              --exclude='android-res' \
+              --exclude='*.md' \
+              --exclude='*.yml' \
+              --exclude='*.zip' \
+              ./ /tmp/www/
+          else
+            echo "ERROR: Khong tim thay index.html"
+            find . -maxdepth 3 -type f | head -50
+            exit 1
+          fi
+
+          if [ ! -f /tmp/www/index.html ]; then
+            echo "ERROR: /tmp/www/index.html missing after copy"
+            ls -la /tmp/www
+            exit 1
+          fi
+
+          # Optional custom launcher icons
+          if [ -d android-res ]; then
+            cp -a android-res /tmp/android-res
+            echo "Custom android-res found"
+            find /tmp/android-res -type f | head -40
+          fi
+
+          # Clean previous capacitor scaffolding
+          rm -rf www android node_modules package.json package-lock.json capacitor.config.* capacitor.config.json
+
+          mkdir -p www
+          cp -a /tmp/www/. www/
+          echo "== www contents =="
+          ls -la www
+          test -f www/index.html
+
+          # Capacitor config (no leading spaces — valid JSON)
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "vn.vatm.hosoxuatcanh",
+            "appName": "VATM Ho so",
+            "webDir": "www",
+            "backgroundColor": "#ffffff",
+            "android": {
+              "allowMixedContent": true
+            },
+            "server": {
+              "androidScheme": "https"
+            }
+          }
+          EOF
+          # Strip accidental leading indent from heredoc if any
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("capacitor.config.json")
+          raw = p.read_text(encoding="utf-8")
+          data = json.loads(raw)
+          p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print("capacitor.config.json OK:", data)
+          PY
+
+          # Minimal package.json
+          cat > package.json <<'EOF'
+          {
+            "name": "vatm-hoso",
+            "version": "1.0.0",
+            "private": true,
+            "description": "VATM Ho so xuat nhap canh"
+          }
+          EOF
+
+          npm install @capacitor/core@6.1.2 @capacitor/cli@6.1.2 @capacitor/android@6.1.2 --no-fund --no-audit
+          npx cap --version
+          ls -la node_modules/@capacitor || true
+
+      - name: Add Android platform and sync
+        run: |
+          set -euo pipefail
+          npx cap add android
+          npx cap sync android
+
+          # Inject custom launcher icons if provided
+          if [ -d /tmp/android-res ]; then
+            RES=android/app/src/main/res
+            echo "Applying custom android-res icons..."
+            # Remove default mipmaps Capacitor generated
+            rm -rf "$RES"/mipmap-*
+            rm -f "$RES"/drawable*/ic_launcher_foreground.xml \
+                  "$RES"/drawable*/ic_launcher_background.xml \
+                  "$RES"/values/ic_launcher_background.xml 2>/dev/null || true
+            cp -a /tmp/android-res/. "$RES"/
+            echo "Icons applied:"
+            find "$RES" -name 'ic_launcher*' | head -40
+          fi
+
+          # Ensure AndroidManifest / gradle files exist
+          test -f android/gradlew
+          test -f android/app/build.gradle || test -f android/app/build.gradle.kts
+          ls -la android
+
+      - name: Patch Gradle for CI stability
+        run: |
+          set -euo pipefail
+          # Increase memory for Gradle
+          mkdir -p android
+          cat >> android/gradle.properties <<'EOF'
+
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          android.useAndroidX=true
+          EOF
+
+          # If using older AGP path issues, force network timeouts a bit higher via init script
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          org.gradle.daemon=false
+          systemProp.org.gradle.internal.http.connectionTimeout=120000
+          systemProp.org.gradle.internal.http.socketTimeout=120000
+          EOF
+
+          echo "==== android/app/build.gradle (head) ===="
+          head -80 android/app/build.gradle 2>/dev/null || head -80 android/app/build.gradle.kts 2>/dev/null || true
+          echo "==== variables.gradle ===="
+          cat android/variables.gradle 2>/dev/null || true
+
+      - name: Build debug APK
+        working-directory: android
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace --info 2>&1 | tee /tmp/gradle-build.log | tail -n 80
+          echo "==== APK outputs ===="
+          find app/build/outputs -type f -name '*.apk' -print || true
+          test -f app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VATM-hoso-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: /tmp/gradle-build.log
+          if-no-files-found: ignore
